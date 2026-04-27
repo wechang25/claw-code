@@ -290,3 +290,128 @@ UsageTracker 在收到每次 API 回應的 Usage 後，將各個欄位的值累�
 UsageCostEstimate 結構提供了成本的分項明細：input_cost_usd（輸入 token 的成本）、output_cost_usd（輸出 token 的成本）、cache_creation_cost_usd（建立快取的成本）和 cache_read_cost_usd（讀取快取的成本）。這些分項讓使用者能夠了解成本的分布——如果輸入成本佔比很高，可能需要精簡系統提示詞或減少工具定義；如果快取讀取比例很低，可能需要最佳化快取策略。
 
 /cost 斜線命令從 UsageTracker 取得累計資料，格式化後顯示給使用者。典型的輸出包括：各類型的 token 數量、各類型的成本估算、快取命中率、以及總成本。
+
+
+### 7.7 錯誤處理的架構策略
+
+Claw Code 在整個系統中採用了一致的錯誤處理策略。Rust 語言的 Result 型別和 ? 運算子為錯誤傳播提供了語言層面的支援，但在大型系統中，錯誤處理的策略設計仍然需要架構師的深思熟慮。
+
+在 Claw Code 中，錯誤處理遵循以下原則：每個 crate 定義自己的錯誤型別，使用 thiserror 或手動實作 std::error::Error trait。crate 之間的錯誤透過 From trait 進行轉換——當一個底層 crate 的錯誤需要被傳遞到上層 crate 時，上層 crate 的錯誤型別包含一個對應的變體，並實作 From 進行自動轉換。
+
+api crate 的 ApiError 是一個典型的例子。它包含七個變體（Http、Json、Authentication、RateLimit、ServerError、InvalidResponse、Configuration），每個變體對應一種特定的錯誤場景。上層的 ConversationRuntime 在呼叫 api crate 時，可以透過 match 表達式對不同的錯誤變體採取不同的處理策略——RateLimit 觸發重試、Authentication 觸發退出提示、ServerError 觸發退避重試。
+
+runtime crate 中的各個子模組也有類似的錯誤設計。permissions.rs 的錯誤型別區分了配置錯誤（設定不正確）和執行時錯誤（權限被拒絕）。sandbox.rs 的錯誤型別區分了環境問題（unshare 不可用）和執行問題（沙箱命令失敗）。這種精細的錯誤分類讓上層程式碼能夠根據錯誤的性質做出合理的決策。
+
+在使用者面向的層面，rusty-claude-cli 負責將底層的技術錯誤轉換為人類可讀的錯誤訊息。例如，底層的 reqwest::Error 會被轉換為「無法連線到 AI 服務——請檢查你的網路連線和 API 端點設定」這樣的提示訊息。ColorTheme 結構定義了不同嚴重程度的錯誤的顏色——警告使用黃色、錯誤使用紅色、資訊使用藍色。
+
+### 8.7 plugins crate 的架構角色
+
+plugins crate 雖然在依賴鏈的底部（不依賴其他 crate），但它在系統架構中扮演著重要的角色。它定義了外掛系統的核心抽象——PluginKind（三種外掛類型）、PluginPermission（三種外掛權限）、PluginMetadata（外掛的完整元資料）、PluginTool（外掛提供的工具定義）和 PluginHooks（外掛註冊的勾子）。
+
+PluginManager 是外掛系統的主要入口點。它的 load_plugins 方法負責發現和載入外掛。發現過程會搜尋以下位置：內建外掛目錄（隨 Claw Code 安裝的外掛）、隨附外掛目錄（與專案一起分發的外掛）、設定中指定的外部外掛目錄、以及全域的外掛安裝根目錄。
+
+每個被發現的外掛都會經過驗證——plugin.json 清單檔的格式是否正確、必填的欄位是否存在、指定的腳本檔案是否存在且可執行。驗證通過的外掛會被加入 PluginRegistry，它的工具定義會被註冊到全域的工具清單中，它的勾子會被註冊到 HookRunner 中。
+
+外掛的初始化是可選的——如果外掛的 lifecycle 區段中定義了 init 腳本列表，這些腳本會在外掛載入後被依序執行。初始化腳本可以用於環境準備（如安裝依賴、建立連線、下載資源）。同樣，shutdown 腳本會在 Claw Code 退出時被執行，用於清理資源。
+
+### 8.8 telemetry crate 的設計考量
+
+telemetry crate 被設計為一個輕量級的事件追蹤框架，不依賴任何重量級的遙測庫（如 OpenTelemetry）。這個設計選擇是有意的——Claw Code 作為一個命令列工具，需要快速啟動和低資源消耗，引入大型的遙測框架會增加二進位檔案的大小和啟動時間。
+
+telemetry crate 的核心是 TelemetryEvent 列舉和 TelemetrySink trait。TelemetryEvent 定義了五種事件類型，每種類型攜帶特定的資料結構。TelemetrySink trait 只有一個方法——send_event，接受一個 TelemetryEvent 的參考。任何實作了 TelemetrySink trait 的型別都可以作為遙測資料的接收器。
+
+SessionTracer 結構為每個工作階段維護一個遞增的序列號。序列號使用 AtomicU64 實現，保證在多執行緒環境中的原子性。每個 SessionTraceRecord 都攜帶工作階段 ID 和序列號，這兩個欄位的組合唯一地標識了每一個追蹤記錄，使得事件的排序和去重成為可能。
+
+AnalyticsEvent 結構採用了命名空間和動作的二級分類。namespace 指定事件的來源模組（如 conversation、tools、mcp），action 指定具體的操作（如 tool_call、session_save、mcp_connect）。properties 是一個鍵值對映射，攜帶事件特定的屬性。這種設計讓分析系統能夠在不同的粒度上聚合和過濾事件。
+
+
+### 8.9 mock-anthropic-service 的架構設計
+
+mock-anthropic-service crate 雖然是專門為測試設計的，但它的架構設計同樣值得分析，因為它展示了如何為一個複雜的外部服務建構高品質的測試替身。
+
+mock-anthropic-service 的核心是一個場景驅動的回應產生器。每個測試場景（如 StreamingText、ReadFileRoundtrip、MultiToolTurnRoundtrip 等）定義了一組完整的 SSE 事件序列。當模擬服務收到 API 請求時，它會根據請求的某些特徵（如系統提示詞中的標記字串、訊息歷史中的工具結果等）選擇對應的場景，然後按照預定義的順序產生 SSE 事件。
+
+這種場景驅動的設計有幾個優點。首先，每個場景都是自包含的——它定義了從請求匹配到回應產生的完整邏輯，不需要外部的配置或狀態。其次，場景可以模擬複雜的多步驟互動——例如，MultiToolTurnRoundtrip 場景模擬了「AI 先呼叫工具 A，收到結果後再呼叫工具 B，收到結果後產生最終回應」這樣的多步驟流程。最後，新增場景只需要定義一個新的 SSE 事件序列，不需要修改模擬服務的核心邏輯。
+
+模擬服務還正確地實現了 SSE 的傳輸格式——每個事件以 event: 行指定事件類型，以 data: 行攜帶 JSON 資料，以空行分隔不同的事件。這確保了 api crate 的 SSE 解析器在測試中與在生產中面對的資料格式完全一致。
+
+### 9.10 ProviderKind 的設計權衡
+
+ProviderKind 列舉（Anthropic、Xai、OpenAi）的設計反映了一個實際的權衡：是為每個提供商建立完整獨立的實作，還是盡可能共享程式碼。
+
+Claw Code 選擇了混合方案：Anthropic 有自己專門的客戶端實作（AnthropicClient），因為 Anthropic Messages API 與 OpenAI Chat Completions API 有顯著的差異（不同的系統提示詞格式、不同的 SSE 事件結構、獨特的提示詞快取功能）。xAI 和 OpenAI 共享同一個相容客戶端實作（OpenAiCompatClient），因為它們都遵循 OpenAI Chat Completions API 的格式，區別只在於 API 端點和認證方式。
+
+這種混合方案在程式碼複用和特定功能支援之間取得了良好的平衡。共享客戶端減少了程式碼的重複，而專門的 Anthropic 客戶端確保了 Anthropic 特有功能（如提示詞快取、extended thinking）的正確支援。
+
+未來如果需要支援新的 AI 提供商，開發者可以根據新提供商的 API 格式決定：如果它相容 OpenAI Chat Completions API，只需要配置一個新的 OpenAiCompatClient 實例；如果它有自己獨特的 API 格式，則需要建立一個新的專門客戶端。ProviderClient 列舉的設計允許在不修改上層程式碼的情況下新增新的提供商。
+
+
+### 9.11 api crate 的測試策略
+
+api crate 的測試策略值得特別介紹，因為它展示了如何測試一個與外部服務通訊的元件。
+
+api crate 的核心測試不依賴真實的 AI 提供商 API。取而代之的是，測試使用預先錄製的 SSE 事件序列來驗證解析邏輯。每個測試用例包含一個原始的 SSE 文字字串（模擬 HTTP 回應體）和預期的解析結果。測試將 SSE 文字字串傳入 SseParser，然後比較解析出的 StreamEvent 序列是否與預期匹配。
+
+這種基於預錄資料的測試方法有幾個優點：測試是確定性的（相同的輸入始終產生相同的輸出）、測試是快速的（不需要網路通訊）、測試可以覆蓋各種邊緣情況（如不完整的 SSE 幀、多個事件在同一個 TCP 封包中、含有 Unicode 字元的事件等）。
+
+detect_provider_kind 函數的測試則覆蓋了所有已知的模型名稱前綴和環境變數組合。每個測試用例設定特定的模型名稱和環境變數，然後驗證函數是否回傳了正確的 ProviderKind。
+
+
+### 7.8 依賴管理與版本策略
+
+Claw Code 的外部依賴管理遵循 Rust 生態系統的最佳實踐。Cargo.lock 檔案被提交到版本控制中，確保所有開發者和 CI 環境使用完全相同版本的依賴。工作區層級的 Cargo.toml 使用 workspace.dependencies 區段統一定義共用依賴的版本，各 crate 透過 dep.workspace = true 的語法引用。
+
+核心依賴的版本策略是保守的——傾向於使用穩定的、經過廣泛使用驗證的版本，而不是追蹤最新的版本。tokio 作為非同步執行時期使用主版本一的穩定發布；serde 和 serde_json 使用主版本一；reqwest 使用零點十二系列。這種保守的策略減少了因為依賴更新引入的不穩定性。
+
+然而，安全相關的依賴（如 TLS 函式庫）會被積極地更新，以獲取最新的安全修補。cargo audit 工具被整合到 CI 管線中，自動檢查所有依賴是否有已知的安全漏洞。如果發現漏洞，CI 會發出警告，提醒開發團隊盡快更新受影響的依賴。
+
+依賴的功能（features）選擇也經過仔細考量。例如，tokio 被配置為只啟用需要的功能子集（rt-multi-thread、net、io-util 等），而不是使用 full 功能旗標。這減少了編譯時間和最終二進位檔的大小。
+
+
+### 9.12 連線池與 HTTP/2 的效能影響
+
+api crate 使用的 reqwest HTTP 客戶端內建了連線池管理。連線池的存在對 API 通訊的效能有顯著的影響——第一次建立到 AI 提供商伺服器的連線時，需要經歷 DNS 解析、TCP 三次握手和 TLS 握手三個步驟，總共可能耗時數百毫秒。而連線池中的持久連線可以跳過這些步驟，直接發送 HTTP 請求。
+
+reqwest 還支援 HTTP/2 協定，這是一個對效能友好的特性。HTTP/2 允許在同一個 TCP 連線上多工（multiplexing）多個請求——這意味著即使有多個並發的 API 呼叫（例如同時向多個 MCP 伺服器發送請求），它們可以共享同一個底層的 TCP 連線。HTTP/2 的標頭壓縮功能（HPACK）也減少了重複標頭的傳輸開銷，進一步提升了效能。
+
+在實際的使用模式中，Claw Code 與 AI 提供商之間的連線通常是長壽的——在整個工作階段期間，系統會持續地向同一個提供商發送請求。連線池確保了這些請求能夠復用已建立的連線，避免了重複的連線建立開銷。
+
+對於 SSE 串流請求，情況略有不同。SSE 請求是長連線——HTTP 連線在整個串流期間保持打開，伺服器持續地推送事件。連線在串流結束後才會被釋放回連線池（或關閉）。如果 AI 模型的回應時間很長（如在處理複雜任務時的 Opus 模型），SSE 連線可能佔用較長時間。
+
+
+### 9.13 API 通訊的可觀測性
+
+api crate 透過 telemetry crate 提供了 API 通訊的可觀測性。每次 HTTP 請求的發起和完成都會產生遙測事件——HttpRequestStarted 記錄請求的 URL、方法和時間，HttpRequestSucceeded 記錄回應的狀態碼和延遲，HttpRequestFailed 記錄錯誤資訊。
+
+這些遙測事件讓開發者和運維人員能夠監控 API 通訊的健康狀態。透過分析 HttpRequestSucceeded 事件中的延遲分布，可以識別效能退化——例如，如果某個提供商的平均延遲突然增加，可能意味著提供商的伺服器負載過高。透過統計 HttpRequestFailed 事件的錯誤類型分布，可以識別系統性的問題——例如，如果認證失敗事件突然增加，可能意味著 API 金鑰已過期或被撤銷。
+
+api crate 的 HTTP 客戶端還會在每次請求中附加 ClientIdentity 資訊。對於 Anthropic，這包括自訂的 HTTP 標頭（如 X-Client-Name 和 X-Client-Version）；對於 OpenAI 相容的提供商，這包括 User-Agent 標頭。這些資訊不僅幫助提供商追蹤客戶端的使用情況，在出現問題時也有助於提供商的技術支援團隊進行診斷。
+
+
+### 8.10 json.rs 模組的跨層使用
+
+json.rs 模組雖然定義在 runtime crate 中，但它提供的輔助函式被多個 crate 廣泛使用。其中最重要的是 merge_json_values 函式——它不僅用於設定合併，還用於工具結果的合成（將多個工具的部分結果合併為完整結果）和工作階段資料的更新（將新的元資料與已有的元資料合併）。
+
+sanitize_json_for_display 函式在安全層面扮演著重要角色。當系統需要在日誌、遙測事件或錯誤訊息中包含 JSON 資料時，這個函式會自動偵測並遮蔽可能的敏感欄位。偵測邏輯基於欄位名稱的模式匹配——包含 key、token、secret、password、credential 等關鍵字的欄位會被遮蔽。這種做法雖然不是百分之百完美（可能遺漏使用非標準名稱的敏感欄位），但在實踐中已經能夠覆蓋絕大多數的場景。
+
+
+### 7.9 開發環境的建議設定
+
+對於希望閱讀和修改 Claw Code 原始碼的開發者，以下是推薦的開發環境設定。
+
+首先，安裝 rust-analyzer 語言伺服器。rust-analyzer 為 Rust 程式碼提供了豐富的 IDE 功能——即時的型別推斷、跳轉到定義、查找所有參考、自動完成、行內提示等。在 Visual Studio Code 中，安裝 rust-analyzer 擴充即可；在 Neovim 或 Emacs 中，需要配置 LSP 客戶端來連接 rust-analyzer。
+
+其次，配置 cargo watch 進行即時的背景建構。cargo watch 會監控原始碼檔案的變更，在每次儲存後自動執行建構和測試。典型的命令是 cargo watch -x check（只進行型別檢查，速度最快）或 cargo watch -x clippy（進行完整的靜態分析）。
+
+對於跨 crate 的程式碼導航，rust-analyzer 的工作區模式能夠正確地處理 Cargo Workspace——它會自動發現工作區中的所有 crate，提供跨 crate 的型別推斷和導航功能。在分析 ConversationRuntime 的泛型約束時，rust-analyzer 能夠追蹤 ApiClient 和 ToolExecutor trait 的定義和所有實作，大大簡化了對複雜泛型程式碼的理解。
+
+
+### 9.14 API 金鑰的安全存儲
+
+api crate 處理的 API 金鑰是系統中最敏感的資料之一。金鑰的安全存儲和傳遞需要特別的注意。
+
+在記憶體中，API 金鑰存儲在 ProviderClient 的內部結構中。Rust 的所有權系統確保了金鑰不會被意外地複製或共享——金鑰的生命週期被嚴格地管理。當 ProviderClient 被丟棄時，金鑰的記憶體也會被釋放。
+
+在 HTTP 請求中，金鑰透過認證標頭（x-api-key 或 Authorization）傳遞。HTTPS 的 TLS 加密確保了金鑰在傳輸過程中不會被竊聽。api crate 不支援使用未加密的 HTTP（除了 localhost 的連線，如本地的 Ollama 伺服器），確保了金鑰始終在加密的通道中傳輸。
+
+在日誌和遙測中，sanitize_json_for_display 函式確保了金鑰不會被意外地記錄。即使在除錯模式下，API 金鑰也會被遮蔽顯示（如 sk-ant-***...***）。
